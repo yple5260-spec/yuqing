@@ -1,0 +1,45 @@
+# Runtime customer records, credentials, encryption keys and backups
+/data/
+/backups/
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+*.key
+*.pem
+.env
+.env.*
+!.env.example
+
+# Private demo evidence and source datasets are not source code
+/seed/
+/docs/*真实*
+/docs/*.jpg
+/docs/*.jpeg
+/docs/*.png
+/docs/自动化测试结果.txt
+/SHA256SUMS.txt
+
+# Presentations, documents, spreadsheets and delivery archives
+*.ppt
+*.pptx
+*.pdf
+*.doc
+*.docx
+*.xls
+*.xlsx
+*.zip
+*.tar
+*.gz
+
+# Local environments, caches and logs
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.log
+.DS_Store
+
+# Local delivery instructions and historical acceptance report
+/先读我_启动与使用.md
+/docs/验收报告.md
