@@ -3,7 +3,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 XIN_DATA_DIR=/data XIN_HOST=0.0
 WORKDIR /app
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt && groupadd --gid 10001 app && useradd --uid 10001 --gid app --no-create-home app && mkdir /data && chown app:app /data
-COPY --chown=app:app server.py scoring.py database.py routing.py manage.py migrate_sqlite.py ./
+COPY --chown=app:app server.py scoring.py database.py routing.py storage.py manage.py migrate_sqlite.py migrate_media.py ./
 COPY --chown=app:app static/ ./static/
 USER 10001:10001
 EXPOSE 8765

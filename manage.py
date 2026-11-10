@@ -6,7 +6,7 @@ import server
 p=argparse.ArgumentParser(description='换芯计划运维工具；备份前停止服务。')
 p.add_argument('command',choices=['backup','verify-backup']);p.add_argument('file',type=Path);a=p.parse_args()
 if a.command=='backup':
- if server.database.is_postgres():raise SystemExit('PostgreSQL 请使用 pg_dump 备份，并另行备份 media 和原加密密钥；本命令仅支持 SQLite。')
+ if server.database.is_postgres():raise SystemExit('PostgreSQL 请使用 pg_dump 备份，并另行备份 S3对象/本地media 和原加密密钥；本命令仅支持 SQLite。')
  if not (server.DATA/'xin.db').exists():raise SystemExit('数据目录中没有数据库。')
  server.acquire_instance_lock()
  if a.file.exists():raise SystemExit('目标文件已存在，拒绝覆盖。')
@@ -23,7 +23,7 @@ if a.command=='backup':
     raw=path.read_bytes();z.writestr(name,raw);manifest[name]=hashlib.sha256(raw).hexdigest()
    z.writestr('backup-manifest.json',json.dumps(manifest,ensure_ascii=False,indent=2))
  os.chmod(a.file,0o600)
- print('备份完成：'+str(a.file.resolve())+'\n注意：备份含本地加密密钥，须放入受控加密介质；环境变量提供的密钥须另行备份。')
+ print('备份完成：'+str(a.file.resolve())+'\n注意：备份含本地加密密钥，须放入受控加密介质；环境变量提供的密钥和S3对象须另行备份。')
 else:
  with zipfile.ZipFile(a.file) as z:
   manifest=json.loads(z.read('backup-manifest.json'))

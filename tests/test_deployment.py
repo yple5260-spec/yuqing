@@ -18,6 +18,7 @@ from psycopg import sql
 from psycopg.conninfo import make_conninfo
 import server
 import routing
+import storage
 from migrate_sqlite import migrate
 
 
@@ -25,6 +26,8 @@ class DeploymentTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.original = dict(os.environ)
+        for name in storage.S3_FIELDS:
+            os.environ.pop('TYAPP_S3_' + name, None)
         cls.url = os.environ.get('XIN_TEST_DATABASE_URL')
         if cls.url:
             cls.schema = 'yuqing_test_' + secrets.token_hex(6)
@@ -126,6 +129,8 @@ class MigrationTests(unittest.TestCase):
             with tempfile.TemporaryDirectory() as tmp:
                 source, target = Path(tmp) / 'source', Path(tmp) / 'target'
                 os.environ.pop('TYAPP_DATABASE_URL', None); os.environ.pop('XIN_ENCRYPTION_KEY', None)
+                for name in storage.S3_FIELDS:
+                    os.environ.pop('TYAPP_S3_' + name, None)
                 server.DATA = source; server.init()
                 # Include an encrypted case, an image and a session that must not be migrated.
                 with server.connect() as db:

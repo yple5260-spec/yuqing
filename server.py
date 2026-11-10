@@ -2,6 +2,7 @@
 """换芯计划 / 单节点可部署试点版。无浏览器存储依赖；业务规则由服务端执行。"""
 import database
 import routing
+import storage
 from html import escape
 import argparse, base64, csv, hashlib, hmac, io, json, os, re, secrets, sqlite3, threading, time, zipfile
 from datetime import datetime, timezone
@@ -154,7 +155,8 @@ def acquire_instance_lock():
  except OSError:raise SystemExit('同一数据目录已有实例运行；请勿重复启动，备份前须先停止服务。')
 
 def init(create_accounts=True, create_rules=True):
- global CIPHER
+ global CIPHER, MEDIA
+ MEDIA=storage.Media(DATA)
  DATA.mkdir(parents=True,exist_ok=True);os.chmod(DATA,0o700);(DATA/'media').mkdir(exist_ok=True)
  key=os.environ.get('XIN_ENCRYPTION_KEY','').encode(); kp=DATA/'encryption.key'
  if not key:
@@ -177,6 +179,9 @@ def init(create_accounts=True, create_rules=True):
   CREATE TABLE IF NOT EXISTS imports(id TEXT PRIMARY KEY,body TEXT NOT NULL,actor TEXT,time TEXT,committed INTEGER DEFAULT 0);
   CREATE TABLE IF NOT EXISTS login_limits(ip TEXT PRIMARY KEY,failures INTEGER,locked_until REAL);
   ''')
+  storage.ensure_schema(db)
+  for location in db.execute('SELECT DISTINCT bucket FROM evidence_objects'):
+   if not MEDIA.client or location['bucket']!=MEDIA.bucket:raise ValueError('已有S3证据需要原存储配置，禁止静默回退本地')
   if create_rules and not db.execute('SELECT 1 FROM rules').fetchone():
    db.execute('INSERT INTO rules VALUES(?,?,?,?,?)',(1,js(DEFAULT),'system',now(),'初始需求口径，试点使用前需业务审批'))
   if create_accounts and not db.execute('SELECT 1 FROM accounts').fetchone():
@@ -203,8 +208,8 @@ def add_seed():
    c=normalize_case({'title':sample['title'],'event_code':'2026-'+sample['cell'],'platform':sample['platform'],'url':sample['url'],'phone':'','binding':'pending','source_cell':'2026年明细!'+sample['cell'],'published_at':sample.get('published_at',''),'relevance_basis':'来自用户提供的热线舆情预警登记表；仅确认原文可访问，尚未核实作者身份及传播指标。','metrics':{},'rights_feature':'unknown'},actor)
    db.execute('INSERT INTO cases VALUES(?,?,?,?,?)',(cid,enc(c),1,'样本导入',now()))
    image=ROOT/'seed'/sample['image'];raw=image.read_bytes();eid='EV-'+sample['cell']; filename=eid+Path(sample['image']).suffix
-   (DATA/'media'/filename).write_bytes(CIPHER.encrypt(raw))
    db.execute('INSERT INTO evidence VALUES(?,?,?,?,?,?,?,?,?,?,?)',(eid,cid,sample['url'],sample['captured_at'],digest(raw),filename,sample.get('mime','image/jpeg'),now(),'browser_verified',sample['cell'],'真实浏览器页面截图；仅裁去浏览器工具栏，不生成或重绘原文。当前访问时点留存，不是发帖当日历史快照。'))
+   MEDIA.write(db,eid,filename,CIPHER.encrypt(raw))
    audit(db,'system','导入真实来源样本',cid,sample['cell']+'；未绑定手机号；未虚构评分')
 
 class HTTPError(Exception):
@@ -355,7 +360,7 @@ class Handler(BaseHTTPRequestHandler):
     if path.startswith('/api/evidence/') and method=='GET':
      eid=path.split('/')[-1];row=db.execute('SELECT * FROM evidence WHERE id=?',(eid,)).fetchone()
      if not row:raise HTTPError(404,'证据不存在')
-     raw=CIPHER.decrypt((DATA/'media'/row['filename']).read_bytes())
+     raw=CIPHER.decrypt(MEDIA.read(db,row))
      if digest(raw)!=row['sha256']:raise HTTPError(500,'证据校验失败，禁止展示')
      audit(db,a['username'],'查看证据',row['case_id'],eid);db.commit();return self.send(200,raw,row['mime'])
     if path=='/api/import/preview' and method=='POST':return self.import_preview(db,a,self.body())
@@ -431,8 +436,8 @@ class Handler(BaseHTTPRequestHandler):
   if db.execute('SELECT 1 FROM evidence WHERE case_id=? AND sha256=?',(c['id'],sha)).fetchone():raise Invalid('该图片已保存，不重复入库')
   eid='EV-'+secrets.token_hex(8);ext={'PNG':'.png','JPEG':'.jpg','WEBP':'.webp'}[fmt];fn=eid+ext;note=str(b.get('note','')).strip()
   if not note:raise Invalid('需填写截图核验说明（谁、何时、如何取得）')
-  (DATA/'media'/fn).write_bytes(CIPHER.encrypt(raw))
   db.execute('INSERT INTO evidence VALUES(?,?,?,?,?,?,?,?,?,?,?)',(eid,c['id'],source,stamp,sha,fn,'image/'+('jpeg' if fmt=='JPEG' else fmt.lower()),now(),'manual_upload',c.get('source_cell',''),note))
+  MEDIA.write(db,eid,fn,CIPHER.encrypt(raw))
   # Appending evidence changes the dossier version and invalidates current confirmation.
   base={k:v for k,v in c.items() if k not in ('id','version','created_by','updated_at')};save_case(db,base,a,c);audit(db,a['username'],'追加快照证据',c['id'],eid+' / SHA256 '+sha);db.commit();return self.send(201,{'id':eid,'sha256':sha,'version':c['version']+1})
  def insert_review(self,db,c,r,level,a,note,s):
