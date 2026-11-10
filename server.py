@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """换芯计划 / 单节点可部署试点版。无浏览器存储依赖；业务规则由服务端执行。"""
-from contextlib import contextmanager
+import database
+import routing
+from html import escape
 import argparse, base64, csv, hashlib, hmac, io, json, os, re, secrets, sqlite3, threading, time, zipfile
 from datetime import datetime, timezone
 from http import cookies
@@ -24,12 +26,7 @@ def pw_hash(p,salt=None):
  salt=salt or secrets.token_hex(16)
  return salt+':'+hashlib.pbkdf2_hmac('sha256',p.encode(),bytes.fromhex(salt),300000).hex()
 def pw_ok(p,hashed): return hmac.compare_digest(pw_hash(p,hashed.split(':')[0]),hashed)
-@contextmanager
-def connect():
- db=sqlite3.connect(DATA/'xin.db',timeout=30);db.row_factory=sqlite3.Row;db.execute('PRAGMA foreign_keys=ON')
- try:
-  with db:yield db
- finally:db.close()
+def connect(): return database.connect(DATA)
 
 def enc(o): return CIPHER.encrypt(js(o).encode()).decode()
 def dec(s): return json.loads(CIPHER.decrypt(s.encode()))
@@ -139,7 +136,11 @@ def save_case(db,c,actor,old=None):
  return cid
 
 def acquire_instance_lock():
- global INSTANCE_LOCK
+ global INSTANCE_LOCK, DATABASE_LOCK
+ if database.is_postgres():
+  DATABASE_LOCK=database.psycopg.connect(os.environ['TYAPP_DATABASE_URL'],connect_timeout=10,autocommit=True)
+  if not DATABASE_LOCK.execute("SELECT pg_try_advisory_lock(hashtext(current_database()), hashtext('yuqing-instance'))").fetchone()[0]:
+   DATABASE_LOCK.close();raise SystemExit('该数据库已有应用实例运行，请先停止旧实例。')
  DATA.mkdir(parents=True,exist_ok=True);os.chmod(DATA,0o700)
  INSTANCE_LOCK=open(DATA/'instance.lock','a+b')
  try:
@@ -152,7 +153,7 @@ def acquire_instance_lock():
    fcntl.flock(INSTANCE_LOCK.fileno(),fcntl.LOCK_EX|fcntl.LOCK_NB)
  except OSError:raise SystemExit('同一数据目录已有实例运行；请勿重复启动，备份前须先停止服务。')
 
-def init():
+def init(create_accounts=True, create_rules=True):
  global CIPHER
  DATA.mkdir(parents=True,exist_ok=True);os.chmod(DATA,0o700);(DATA/'media').mkdir(exist_ok=True)
  key=os.environ.get('XIN_ENCRYPTION_KEY','').encode(); kp=DATA/'encryption.key'
@@ -176,9 +177,9 @@ def init():
   CREATE TABLE IF NOT EXISTS imports(id TEXT PRIMARY KEY,body TEXT NOT NULL,actor TEXT,time TEXT,committed INTEGER DEFAULT 0);
   CREATE TABLE IF NOT EXISTS login_limits(ip TEXT PRIMARY KEY,failures INTEGER,locked_until REAL);
   ''')
-  if not db.execute('SELECT 1 FROM rules').fetchone():
+  if create_rules and not db.execute('SELECT 1 FROM rules').fetchone():
    db.execute('INSERT INTO rules VALUES(?,?,?,?,?)',(1,js(DEFAULT),'system',now(),'初始需求口径，试点使用前需业务审批'))
-  if not db.execute('SELECT 1 FROM accounts').fetchone():
+  if create_accounts and not db.execute('SELECT 1 FROM accounts').fetchone():
    creds=[]
    for name,roles in [('admin',['admin','analyst','exporter','viewer']),('reviewer',['reviewer','viewer'])]:
     password=secrets.token_urlsafe(14);db.execute('INSERT INTO accounts(username,password,roles) VALUES(?,?,?)',(name,pw_hash(password),js(roles)))
@@ -233,7 +234,7 @@ class Handler(BaseHTTPRequestHandler):
   jar=cookies.SimpleCookie()
   try:jar.load(self.headers.get('Cookie',''))
   except cookies.CookieError:raise HTTPError(401,'请先登录')
-  token=jar.get('xin_session'); row=None
+  token=jar.get(routing.cookie_name()); row=None
   if token:row=db.execute('SELECT s.*,a.roles,a.active FROM sessions s JOIN accounts a ON s.username=a.username WHERE s.token=? AND s.expires>?',(digest(token.value.encode()),time.time())).fetchone()
   if not row or not row['active']:raise HTTPError(401,'登录已失效，请重新登录')
   if write:
@@ -252,20 +253,29 @@ class Handler(BaseHTTPRequestHandler):
    path=urlsplit(self.path).path;query=parse_qs(urlsplit(self.path).query)
    # DNS-rebinding guard, accepts only configured Host names (exact hostname, port ignored).
    host=self.headers.get('Host','').split(':')[0]
+   try:self.route_base=routing.route_base(self.headers,self.client_address[0])
+   except ValueError:raise HTTPError(400,'入口路径配置无效')
    allowed=os.environ.get('XIN_ALLOWED_HOSTS','127.0.0.1,localhost').split(',')
    if host not in allowed:raise HTTPError(403,'Host不在允许列表')
-   if method=='GET' and path=='/health':return self.send(200,{'status':'ok','version':'1.0-pilot'})
-   if method=='GET' and (path=='/' or path.startswith('/static/')):
-    rel='static/index.html' if path=='/' else path.lstrip('/');p=(ROOT/rel).resolve()
+   if method=='GET' and path=='/health':
+    try:
+     with connect() as health_db:health_db.execute('SELECT 1').fetchone()
+     if not os.access(DATA,os.W_OK):raise OSError()
+    except Exception:return self.send(503,{'status':'unavailable'})
+    return self.send(200,{'status':'ok','version':'1.0-pilot'})
+   if method=='GET' and (path in ('/','/login') or path.startswith('/static/')):
+    rel='static/index.html' if path in ('/','/login') else path.lstrip('/');p=(ROOT/rel).resolve()
     if not p.is_relative_to(ROOT/'static') or not p.is_file():raise HTTPError(404,'文件不存在')
     types={'.html':'text/html; charset=utf-8','.js':'application/javascript; charset=utf-8','.css':'text/css; charset=utf-8','.png':'image/png','.svg':'image/svg+xml'}
-    return self.send(200,p.read_bytes(),types.get(p.suffix,'application/octet-stream'))
+    raw=p.read_bytes()
+    if p.name=='index.html':raw=raw.replace(b'<!--APP_BASE-->',('<base href="'+escape(routing.cookie_path(self.route_base),quote=True)+'">').encode())
+    return self.send(200,raw,types.get(p.suffix,'application/octet-stream'))
    with LOCK,connect() as db:
     if path=='/api/login' and method=='POST':return self.login(db,self.body())
     a=self.actor(db,method!='GET')
     if path=='/api/me' and method=='GET':return self.send(200,{k:a[k] for k in ('username','roles','csrf')})
     if path=='/api/logout' and method=='POST':
-     db.execute('DELETE FROM sessions WHERE token=?',(a['token'],));audit(db,a['username'],'退出登录');db.commit();return self.send(200,{'ok':True},headers={'Set-Cookie':'xin_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0'})
+     db.execute('DELETE FROM sessions WHERE token=?',(a['token'],));audit(db,a['username'],'退出登录');db.commit();return self.send(200,{'ok':True},headers={'Set-Cookie':routing.cookie_name()+'=; HttpOnly; SameSite=Strict; Path='+routing.cookie_path(self.route_base)+'; Max-Age=0'+('; Secure' if os.environ.get('XIN_SECURE_COOKIE')=='1' else '')})
     if path=='/api/password' and method=='POST':
      b=self.body();row=db.execute('SELECT password FROM accounts WHERE username=?',(a['username'],)).fetchone()
      if not pw_ok(str(b.get('old','')),row[0]):raise Invalid('原密码不正确')
@@ -380,9 +390,9 @@ class Handler(BaseHTTPRequestHandler):
    raise HTTPError(404,'接口不存在或请求方法不支持')
   except HTTPError as e:self.send(e.status,{'error':e.message})
   except Invalid as e:self.send(422,{'error':str(e)})
-  except sqlite3.IntegrityError:self.send(409,{'error':'数据冲突，请刷新后重试'})
+  except database.IntegrityError:self.send(409,{'error':'数据冲突，请刷新后重试'})
   except Exception as e:
-   print('SERVER ERROR',type(e).__name__,str(e)[:150],flush=True);self.send(500,{'error':'处理失败，原事务未提交。请联系管理员检查服务日志。'})
+   print('SERVER ERROR',type(e).__name__,flush=True);self.send(500,{'error':'处理失败，原事务未提交。请联系管理员检查服务日志。'})
  def password_valid(self,p):
   if not isinstance(p,str) or len(p)<12 or len(p)>128:raise Invalid('密码长度须为12–128位')
  def login(self,db,b):
@@ -395,10 +405,10 @@ class Handler(BaseHTTPRequestHandler):
   if not valid or not row or not row['active']:
    fail=(row['failures'] if row else 0)+1
    if row:db.execute('UPDATE accounts SET failures=?,locked_until=? WHERE username=?',(fail,t+900 if fail>=5 else 0,u))
-   n=(limit['failures'] if limit else 0)+1;db.execute('INSERT OR REPLACE INTO login_limits VALUES(?,?,?)',(ip,n,t+900 if n>=20 else 0));audit(db,'anonymous','登录失败','','未记录输入账号和密码');db.commit();raise HTTPError(401,'账号或密码错误')
+   n=(limit['failures'] if limit else 0)+1;db.execute('INSERT INTO login_limits VALUES(?,?,?) ON CONFLICT(ip) DO UPDATE SET failures=excluded.failures,locked_until=excluded.locked_until',(ip,n,t+900 if n>=20 else 0));audit(db,'anonymous','登录失败','','未记录输入账号和密码');db.commit();raise HTTPError(401,'账号或密码错误')
   token=secrets.token_urlsafe(32);csrf=secrets.token_urlsafe(32);db.execute('UPDATE accounts SET failures=0,locked_until=0 WHERE username=?',(u,));db.execute('DELETE FROM login_limits WHERE ip=?',(ip,));db.execute('DELETE FROM sessions WHERE expires<?',(t,));db.execute('INSERT INTO sessions VALUES(?,?,?,?)',(digest(token.encode()),u,csrf,t+8*3600));audit(db,u,'登录成功');db.commit()
   secure='; Secure' if os.environ.get('XIN_SECURE_COOKIE')=='1' else ''
-  return self.send(200,{'username':u,'roles':json.loads(row['roles']),'csrf':csrf},headers={'Set-Cookie':'xin_session='+token+'; HttpOnly; SameSite=Strict; Path=/; Max-Age=28800'+secure})
+  return self.send(200,{'username':u,'roles':json.loads(row['roles']),'csrf':csrf},headers={'Set-Cookie':routing.cookie_name()+'='+token+'; HttpOnly; SameSite=Strict; Path='+routing.cookie_path(self.route_base)+'; Max-Age=28800'+secure})
  def upload(self,db,a,c,b):
   self.need(a,'admin','analyst')
   if b.get('expected_version')!=c['version']:raise HTTPError(409,'档案已更新，请刷新后上传')
@@ -514,10 +524,11 @@ class Handler(BaseHTTPRequestHandler):
   writer.writerow(headers)
   for row in out:writer.writerow([safe(v) for v in row])
   raw=('\ufeff'+stream.getvalue()).encode();sha=digest(raw)
-  db.execute('INSERT INTO exports VALUES(?,?,?,?,?,?,?,NULL)',(bid,CIPHER.encrypt(raw).decode(),sha,len(out),a['username'],now(),('正式客服导入：' if full else '脱敏解释报表：')+purpose));audit(db,a['username'],'生成正式导出' if full else '生成脱敏报表',bid,str(len(out))+'条 / '+sha);db.commit();return self.send(201,{'id':bid,'count':len(out),'sha256':sha,'download':'/api/exports/'+bid+'/download','status':'已生成，尚无目标系统回执'})
+  db.execute('INSERT INTO exports VALUES(?,?,?,?,?,?,?,NULL)',(bid,CIPHER.encrypt(raw).decode(),sha,len(out),a['username'],now(),('正式客服导入：' if full else '脱敏解释报表：')+purpose));audit(db,a['username'],'生成正式导出' if full else '生成脱敏报表',bid,str(len(out))+'条 / '+sha);db.commit();return self.send(201,{'id':bid,'count':len(out),'sha256':sha,'download':'api/exports/'+bid+'/download','status':'已生成，尚无目标系统回执'})
 
 def main():
  parser=argparse.ArgumentParser();parser.add_argument('--host',default=os.environ.get('XIN_HOST','127.0.0.1'));parser.add_argument('--port',type=int,default=int(os.environ.get('XIN_PORT','8765')));parser.add_argument('--no-seed',action='store_true');args=parser.parse_args()
+ if os.environ.get('XIN_REQUIRE_POSTGRES')=='1' and not database.is_postgres():raise SystemExit('缺少 TYAPP_DATABASE_URL，拒绝使用临时 SQLite')
  acquire_instance_lock()
  init()
  if not args.no_seed:add_seed()

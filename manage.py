@@ -6,6 +6,7 @@ import server
 p=argparse.ArgumentParser(description='换芯计划运维工具；备份前停止服务。')
 p.add_argument('command',choices=['backup','verify-backup']);p.add_argument('file',type=Path);a=p.parse_args()
 if a.command=='backup':
+ if server.database.is_postgres():raise SystemExit('PostgreSQL 请使用 pg_dump 备份，并另行备份 media 和原加密密钥；本命令仅支持 SQLite。')
  if not (server.DATA/'xin.db').exists():raise SystemExit('数据目录中没有数据库。')
  server.acquire_instance_lock()
  if a.file.exists():raise SystemExit('目标文件已存在，拒绝覆盖。')

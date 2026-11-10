@@ -28,7 +28,7 @@ class EndToEnd(unittest.TestCase):
  def setUpClass(cls):
   import socket
   s=socket.socket();s.bind(('127.0.0.1',0));cls.port=s.getsockname()[1];s.close()
-  cls.tmp=tempfile.TemporaryDirectory();cls.env=dict(os.environ,XIN_DATA_DIR=cls.tmp.name)
+  cls.tmp=tempfile.TemporaryDirectory();cls.env=dict(os.environ,XIN_DATA_DIR=cls.tmp.name,XIN_ENV_FILE=str(Path(cls.tmp.name)/'missing.env'),TYAPP_DATABASE_URL='',XIN_ENCRYPTION_KEY='',XIN_REQUIRE_POSTGRES='0')
   cls.log=open(Path(cls.tmp.name)/'test-server.log','w');cls.proc=subprocess.Popen([sys.executable,str(ROOT/'server.py'),'--port',str(cls.port)],env=cls.env,stdout=cls.log,stderr=cls.log)
   for _ in range(100):
    try:
