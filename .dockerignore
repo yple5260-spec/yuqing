@@ -17,3 +17,13 @@ backups
 *.log
 tests
 *.zip
+runtime
+local-data
+资料
+prototype
+.agent-meet
+.impeccable
+交付
+演示版
+media
+instance.lock

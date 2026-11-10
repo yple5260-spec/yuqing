@@ -29,6 +29,9 @@ python launcher.py
 
 ## 目录
 
+- 当前目录已连接 `https://github.com/yple5260-spec/yuqing.git`；本机使用 `.venv` 和未提交的 `.env`。
+- `prototype/original/index.html`：原样保留的最早六菜单原型，使用构造数据，与业务系统独立；见 [原型说明](prototype/README.md)。
+- `资料/`、`local-data/`、`runtime/`：本地需求资料、原SQLite备份及运行文件，排除出Git和镜像；历史演示和临时交付已移出，见 [整理记录](docs/目录整理.md)。
 - `server.py`：业务 API、访问控制、存储、导入导出及审计。
 - `scoring.py`：评分规则校验、证据约束及得分区间。
 - `static/`：HTML、CSS、JavaScript 和中国联通标识。

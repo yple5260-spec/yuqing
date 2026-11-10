@@ -1,0 +1,2 @@
+# Preserve the archived prototype byte-for-byte across checkouts.
+prototype/original/** -text -whitespace
