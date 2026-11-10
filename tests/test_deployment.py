@@ -71,9 +71,10 @@ class DeploymentTests(unittest.TestCase):
         prefix = {'X-OneView-Route-Base': '/apps/bfzx-yqda'}
         for base in ('/', '/apps/bfzx-yqda/'):
             headers = {'X-OneView-Route-Base': base.rstrip('/') or '/'}
-            st, raw, _ = self.request('GET', '/login', headers=headers)
+            st, raw, response_headers = self.request('GET', '/login', headers=headers)
             self.assertEqual(st, 200)
             self.assertIn(('<base href="' + base + '">').encode(), raw)
+            self.assertIn("base-uri 'self'", response_headers['Content-Security-Policy'])
             self.assertNotIn(b'src="/static/', raw)
         self.assertEqual(self.request('GET', '/health')[0], 200)
         self.assertEqual(self.request('GET', '/api/cases')[0], 401)

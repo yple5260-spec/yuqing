@@ -217,7 +217,7 @@ class Handler(BaseHTTPRequestHandler):
  def send(self,status,data,ctype='application/json; charset=utf-8',headers=None):
   raw=(js(data).encode() if not isinstance(data,bytes) else data)
   self.send_response(status);self.send_header('Content-Type',ctype);self.send_header('Content-Length',str(len(raw)))
-  for k,v in {'Cache-Control':'no-store','X-Content-Type-Options':'nosniff','X-Frame-Options':'DENY','Referrer-Policy':'no-referrer','Content-Security-Policy':"default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'",**(headers or {})}.items():self.send_header(k,v)
+  for k,v in {'Cache-Control':'no-store','X-Content-Type-Options':'nosniff','X-Frame-Options':'DENY','Referrer-Policy':'no-referrer','Content-Security-Policy':"default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'",**(headers or {})}.items():self.send_header(k,v)
   self.end_headers();self.wfile.write(raw)
  def body(self):
   if self.headers.get('Transfer-Encoding'):raise HTTPError(400,'不支持分块请求')
