@@ -39,7 +39,11 @@ def migrate(source, apply=False):
         src.execute('BEGIN')
         if src.execute('PRAGMA integrity_check').fetchone()[0] != 'ok':
             raise ValueError('源数据库完整性检查失败')
-        rows = {t: [dict(r) for r in src.execute('SELECT * FROM ' + t)] for t in TABLES}
+        source_tables = {r[0] for r in src.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        tables = TABLES + (('collection_jobs',) if 'collection_jobs' in source_tables else ())
+        rows = {t: [dict(r) for r in src.execute('SELECT * FROM ' + t)] for t in tables}
+        for row in rows.get('collection_jobs', []):
+            json.loads(cipher.decrypt(row['detail'].encode()))
         for table in ('cases', 'history', 'exports', 'imports'):
             for row in rows[table]:
                 raw = cipher.decrypt(row['body'].encode())
@@ -61,7 +65,7 @@ def migrate(source, apply=False):
             if hashlib.sha256(raw).hexdigest() != row['sha256']:
                 raise ValueError('证据文件摘要不一致')
         with database.connect(target_data) as target:
-            for table in TABLES + ('sessions', 'login_limits'):
+            for table in TABLES + ('collection_jobs', 'sessions', 'login_limits'):
                 exists = target.execute('SELECT to_regclass(?)', (table,)).fetchone()[0]
                 if exists and target.execute('SELECT COUNT(*) FROM ' + table).fetchone()[0]:
                     raise ValueError('目标库已有应用数据，拒绝覆盖或合并')
@@ -97,11 +101,11 @@ def migrate(source, apply=False):
         server.init(create_accounts=False, create_rules=False)
         with database.connect(target_data) as target:
             # Recheck under table locks so another writer cannot race the empty-target check.
-            target.execute('LOCK TABLE ' + ','.join(TABLES + ('sessions', 'login_limits')) + ' IN ACCESS EXCLUSIVE MODE')
-            for table in TABLES + ('sessions', 'login_limits'):
+            target.execute('LOCK TABLE ' + ','.join(TABLES + ('collection_jobs', 'sessions', 'login_limits')) + ' IN ACCESS EXCLUSIVE MODE')
+            for table in TABLES + ('collection_jobs', 'sessions', 'login_limits'):
                 if target.execute('SELECT COUNT(*) FROM ' + table).fetchone()[0]:
                     raise ValueError('目标数据在预检后变化，迁移已回滚')
-            for table in TABLES:
+            for table in tables:
                 for row in rows[table]:
                     columns = ','.join(row)
                     target.execute(f'INSERT INTO {table} ({columns}) VALUES ({",".join("?" for _ in row)})', tuple(row.values()))

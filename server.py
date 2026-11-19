@@ -3,7 +3,11 @@
 import database
 import routing
 import storage
+import collection
+import jobs
+import portrait
 from html import escape
+import sys
 import argparse, base64, csv, hashlib, hmac, io, json, os, re, secrets, sqlite3, threading, time, zipfile
 from datetime import datetime, timezone
 from http import cookies
@@ -72,20 +76,25 @@ def case_view(db,c,actor,detail=False):
  c['evaluation']=s;c['review']=review;c['evidence_count']=len(ev)
  c['status']='已确认' if review else ('待复核' if s['eligible'] else ('待绑定' if c.get('binding')!='verified' else '证据待补全'))
  if detail:
+  c['portrait']=portrait.build(c)
   c['evidence']=list(ev.values())
+  task=db.execute('SELECT * FROM collection_jobs WHERE case_id=? ORDER BY updated_at DESC,id DESC LIMIT 1',(c['id'],)).fetchone()
+  c['collection_task']=jobs.view(task,sys.modules[__name__]) if task else None
   c['reviews']=[dict(x) for x in db.execute('SELECT * FROM reviews WHERE case_id=? ORDER BY id DESC',(c['id'],))]
  else:c.pop('metrics',None)
  return c
 
 def normalize_case(d,actor,old=None):
- allowed=['event_code','title','platform','url','phone','phone_source','binding','binding_basis','relevance_basis','internal_level','rights_feature','rights_basis','quality_note','source_cell','published_at','metrics']
+ allowed=['event_code','title','user_name','platform','url','phone','phone_source','binding','binding_basis','relevance_basis','internal_level','rights_feature','rights_basis','quality_note','source_cell','published_at','metrics']
  c={k:d.get(k,old.get(k,'') if old else '') for k in allowed}
+ if old and old.get('collection'):c['collection']=old['collection']
  for k in allowed:
   if k!='metrics':
    if not isinstance(c[k],str) or len(c[k])>5000: raise Invalid('文本字段格式错误或过长')
    c[k]=c[k].strip()
  if not c['title'] or not c['event_code']:raise Invalid('事件编号、事件标题为必填')
  if not url_valid(c['url']): raise Invalid('请输入有效HTTP(S)原文链接')
+ if len(c['user_name'])>100:raise Invalid('用户姓名不能超过100字')
  if c['phone'] and not re.fullmatch(r'1\d{10}',c['phone']):raise Invalid('手机号须为11位；未知可留空')
  if c['binding'] not in ('pending','verified'):raise Invalid('绑定状态只能为待核实或已核实')
  changed=not old or any(c.get(k)!=old.get(k) for k in ('phone','phone_source','binding_basis','binding'))
@@ -119,12 +128,55 @@ def normalize_case(d,actor,old=None):
   c['metrics'][k]={'value':v,'evidence':refs,'basis':basis.strip(),'observed_at':obs,'pair':pair}
  return c
 
+def intake_case(b,actor):
+ if any(not isinstance(b.get(k),str) or not b[k].strip() for k in ('url','phone','user_name')):raise Invalid('请填写舆情链接、手机号和用户姓名')
+ try:platform=collection.platform_for(b['url'].strip())
+ except ValueError:platform='待识别'
+ return normalize_case({'url':b['url'],'phone':b['phone'],'user_name':b['user_name'],
+  'event_code':'EV-'+secrets.token_hex(6).upper(),'title':'待采集原文标题','platform':platform,
+  'binding':'pending','phone_source':'建档人员录入，待核实','rights_feature':'unknown','metrics':{}},actor)
+
+def three_field_rows(b):
+ if b.get('format')=='csv':
+  reader=csv.DictReader(io.StringIO(str(b.get('text','')).lstrip('\ufeff')))
+  rows=list(enumerate(reader,2));headers=reader.fieldnames or []
+ else:
+  try:
+   raw=base64.b64decode(b.get('data',''),validate=True)
+   with zipfile.ZipFile(io.BytesIO(raw)) as z:
+    if len(z.infolist())>10000 or sum(x.file_size for x in z.infolist())>100*1024*1024:raise Invalid('工作簿展开后过大')
+    ns={'m':'http://schemas.openxmlformats.org/spreadsheetml/2006/main'}
+    wb=ET.fromstring(z.read('xl/workbook.xml'));sheet=wb.find('m:sheets',ns)[0]
+    rels={x.attrib['Id']:x.attrib['Target'] for x in ET.fromstring(z.read('xl/_rels/workbook.xml.rels'))}
+    target=rels[sheet.attrib['{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id']]
+    target=target.lstrip('/') if target.startswith('/') else 'xl/'+target
+    shared=[''.join(t.text or '' for t in si.iter('{'+ns['m']+'}t')) for si in ET.fromstring(z.read('xl/sharedStrings.xml'))] if 'xl/sharedStrings.xml' in z.namelist() else []
+    xml=ET.fromstring(z.read(target));table=[]
+    for row in xml.findall('.//m:sheetData/m:row',ns):
+     values={}
+     for cell in row.findall('m:c',ns):
+      col=re.sub(r'\d','',cell.attrib.get('r',''))
+      v=cell.find('m:v',ns);value=(v.text or '') if v is not None else ''.join(t.text or '' for t in cell.findall('.//m:t',ns))
+      if cell.attrib.get('t')=='s':value=shared[int(value)]
+      values[col]=value.strip()
+     if any(values.values()):table.append((row.attrib.get('r',''),values))
+    if not table:raise Invalid('工作表为空')
+    headers=list(table[0][1].values());mapping=table[0][1]
+    rows=[(n,{key:values.get(col,'') for col,key in mapping.items()}) for n,values in table[1:]]
+  except Invalid:raise
+  except Exception:raise Invalid('无法读取三项工作簿，请使用首个工作表和标准列名') from None
+ aliases={'url':('舆情原文链接','舆情链接','舆情网址','链接'),'phone':('手机号','用户手机号'),'user_name':('用户姓名','姓名')}
+ columns={key:next((name for name in names if name in headers),None) for key,names in aliases.items()}
+ if not all(columns.values()):raise Invalid('请使用三列：舆情原文链接、手机号、用户姓名')
+ return [(line,{key:row.get(column,'') for key,column in columns.items()}) for line,row in rows if any(row.values())]
+
 def save_case(db,c,actor,old=None):
  # Original links are not identity proof. Cross-phone reuse is a hard conflict.
+ source_key=collection.source_key(c['url'])
  for row in db.execute('SELECT id,body FROM cases'):
   if old and row['id']==old['id']:continue
   x=dec(row['body'])
-  if x['url']==c['url']:raise Invalid('该链接已有档案，请在原档案补充，避免重复绑定')
+  if collection.source_key(x['url'])==source_key:raise Invalid('该链接已有档案，请在原档案补充，避免重复绑定')
   if c['phone'] and x.get('phone')==c['phone'] and x['event_code']==c['event_code']:raise Invalid('相同手机号及事件编号已建档')
  if old:
   version=old['version']+1;cid=old['id']
@@ -135,6 +187,45 @@ def save_case(db,c,actor,old=None):
   db.execute('INSERT INTO cases(id,body,version,created_by,updated_at) VALUES(?,?,?,?,?)',(cid,enc(c),version,actor['username'],now()))
  audit(db,actor['username'],'更新档案' if old else '创建档案',cid,'记录版本 '+str(version)+'；历史复核不删除，新版本需重新复核')
  return cid
+
+def store_evidence(db,a,c,b,method='manual_upload'):
+ if b.get('expected_version')!=c['version']:raise Invalid('档案已更新，请刷新后上传')
+ source=b.get('source_url','')
+ if source!=c['url']:raise Invalid('截图来源必须与本档案原文链接一致')
+ stamp=str(b.get('captured_at',''))
+ try:
+  dt=datetime.fromisoformat(stamp)
+  if not dt.tzinfo or dt.timestamp()>time.time()+300:raise ValueError()
+ except ValueError:raise Invalid('留存时间需为含时区的实际时间，不能填写未来时间')
+ try:
+  raw=base64.b64decode(b.get('data',''),validate=True)
+  if len(raw)>12*1024*1024:raise Invalid('单张图片上限12MB')
+  with Image.open(io.BytesIO(raw)) as im:
+   if im.format not in ('PNG','JPEG','WEBP') or im.width*im.height>40000000:raise Invalid('仅接受PNG/JPEG/WebP，像素数不超过4000万')
+   fmt=im.format;im.verify()
+ except Invalid:raise
+ except Exception:raise Invalid('文件不是有效的PNG/JPEG/WebP图片')
+ sha=digest(raw)
+ duplicate=db.execute('SELECT id FROM evidence WHERE case_id=? AND sha256=?',(c['id'],sha)).fetchone()
+ if duplicate:
+  if method!='browser_capture':raise Invalid('该图片已保存，不重复入库')
+  base={k:v for k,v in c.items() if k not in ('id','version','created_by','updated_at')};save_case(db,base,a,c)
+  audit(db,a['username'],'更新采集字段并复用已有快照',c['id'],duplicate['id']+' / SHA256 '+sha)
+  return {'id':duplicate['id'],'sha256':sha,'version':c['version']+1,'reused':True,'collection_state':c.get('collection',{}).get('collection_state','complete')}
+ eid='EV-'+secrets.token_hex(8);ext={'PNG':'.png','JPEG':'.jpg','WEBP':'.webp'}[fmt];fn=eid+ext;note=str(b.get('note','')).strip()
+ if not note:raise Invalid('需填写截图核验说明（谁、何时、如何取得）')
+ db.execute('INSERT INTO evidence VALUES(?,?,?,?,?,?,?,?,?,?,?)',(eid,c['id'],source,stamp,sha,fn,'image/'+('jpeg' if fmt=='JPEG' else fmt.lower()),now(),method,c.get('source_cell',''),note))
+ MEDIA.write(db,eid,fn,CIPHER.encrypt(raw))
+ # Appending evidence changes the dossier version and invalidates current confirmation.
+ base={k:v for k,v in c.items() if k not in ('id','version','created_by','updated_at')};save_case(db,base,a,c);audit(db,a['username'],'追加快照证据',c['id'],eid+' / SHA256 '+sha);return {'id':eid,'sha256':sha,'version':c['version']+1,'collection_state':c.get('collection',{}).get('collection_state','complete')}
+
+def apply_capture(db,a,c,report):
+ report=dict(report);data=report.pop('data');activity=portrait.activity7(report)
+ report.update(activity7=activity,posts7=activity['count'],posts_per_day7=activity['per_day']);c=dict(c,collection=report)
+ for key in ('title','platform'):c[key]=report[key]
+ if report.get('published_at'):c['published_at']=report['published_at']
+ return store_evidence(db,a,c,{'expected_version':c['version'],'source_url':c['url'],
+  'captured_at':report['captured_at'],'data':data,'note':'Crawl4AI浏览器采集公开原文'+('卡片' if report.get('platform')=='微博' else '整页')+'截图；作者昵称不等同实名或手机号绑定。'+report['metrics_note']},method='browser_capture')
 
 def acquire_instance_lock():
  global INSTANCE_LOCK, DATABASE_LOCK
@@ -180,6 +271,7 @@ def init(create_accounts=True, create_rules=True):
   CREATE TABLE IF NOT EXISTS login_limits(ip TEXT PRIMARY KEY,failures INTEGER,locked_until REAL);
   ''')
   storage.ensure_schema(db)
+  jobs.ensure_schema(db)
   for location in db.execute('SELECT DISTINCT bucket FROM evidence_objects'):
    if not MEDIA.client or location['bucket']!=MEDIA.bucket:raise ValueError('已有S3证据需要原存储配置，禁止静默回退本地')
   if create_rules and not db.execute('SELECT 1 FROM rules').fetchone():
@@ -275,6 +367,8 @@ class Handler(BaseHTTPRequestHandler):
     raw=p.read_bytes()
     if p.name=='index.html':raw=raw.replace(b'<!--APP_BASE-->',('<base href="'+escape(routing.cookie_path(self.route_base),quote=True)+'">').encode())
     return self.send(200,raw,types.get(p.suffix,'application/octet-stream'))
+   if method=='POST' and re.fullmatch(r'/api/cases/[^/]+/collect',path):
+    return self.collect_case(path.split('/')[3],self.body())
    with LOCK,connect() as db:
     if path=='/api/login' and method=='POST':return self.login(db,self.body())
     a=self.actor(db,method!='GET')
@@ -311,6 +405,14 @@ class Handler(BaseHTTPRequestHandler):
       new=validate_rules(b);note=str(b.get('note','')).strip()
       if not note:raise Invalid('规则发布必须填写变更依据')
       v=r['version']+1;db.execute('INSERT INTO rules VALUES(?,?,?,?,?)',(v,js(new),a['username'],now(),note));audit(db,a['username'],'发布评分规则','R'+str(v),note);db.commit();return self.send(201,{'version':v})
+    if path=='/api/intake' and method=='POST':
+     self.need(a,'admin','analyst');b=self.body()
+     c=intake_case(b,a);cid=save_case(db,c,a);saved=loadcase(db,cid)
+     task=jobs.enqueue(db,saved,a,sys.modules[__name__]);db.commit()
+     return self.send(201,dict(case_view(db,saved,a,True),task=task))
+    if path=='/api/collection/jobs' and method=='GET':return self.job_list(db,a,query)
+    if re.fullmatch(r'/api/collection/jobs/[^/]+/retry',path) and method=='POST':
+     self.need(a,'admin','analyst');task=jobs.retry(db,path.split('/')[4],a,sys.modules[__name__]);db.commit();return self.send(202,task)
     if path=='/api/cases':
      if method=='GET':
       vals=[case_view(db,loadcase(db,x[0]),a) for x in db.execute('SELECT id FROM cases ORDER BY updated_at DESC')]
@@ -367,9 +469,14 @@ class Handler(BaseHTTPRequestHandler):
     if path=='/api/import/commit' and method=='POST':
      self.need(a,'admin','analyst');b=self.body();rec=db.execute('SELECT * FROM imports WHERE id=? AND committed=0',(b.get('id',''),)).fetchone()
      if not rec or rec['actor']!=a['username']:raise Invalid('预览批次不存在、已提交或不是本人创建')
-     rows=dec(rec['body']);created=[]
-     for c in rows:created.append(save_case(db,c,a))
-     db.execute('UPDATE imports SET committed=1 WHERE id=?',(rec['id'],));audit(db,a['username'],'提交导入批次',rec['id'],str(len(created))+'条');db.commit();return self.send(201,{'created':created})
+     rows=dec(rec['body']);created=[];skipped=[]
+     existing={collection.source_key(dec(x[0])['url']) for x in db.execute('SELECT body FROM cases')}
+     for c in rows:
+      key=collection.source_key(c['url'])
+      if key in existing:skipped.append(c.get('source_cell') or c['event_code']);continue
+      cid=save_case(db,c,a);created.append(cid);existing.add(key)
+      jobs.enqueue(db,loadcase(db,cid),a,sys.modules[__name__],rec['id'])
+     db.execute('UPDATE imports SET committed=1 WHERE id=?',(rec['id'],));audit(db,a['username'],'提交导入批次',rec['id'],str(len(created))+'条 / 跳过'+str(len(skipped))+'条重复');db.commit();return self.send(201,{'created':created,'skipped':skipped,'batch_id':rec['id']})
     if path=='/api/exports' and method=='GET':
      self.need(a,'admin','exporter');return self.send(200,[dict({k:x[k] for k in ('id','sha256','count','actor','time','purpose','receipt')},stale=export_stale(db,x)) for x in db.execute('SELECT * FROM exports ORDER BY time DESC')])
     if path=='/api/exports' and method=='POST':return self.export(db,a,self.body())
@@ -414,32 +521,35 @@ class Handler(BaseHTTPRequestHandler):
   token=secrets.token_urlsafe(32);csrf=secrets.token_urlsafe(32);db.execute('UPDATE accounts SET failures=0,locked_until=0 WHERE username=?',(u,));db.execute('DELETE FROM login_limits WHERE ip=?',(ip,));db.execute('DELETE FROM sessions WHERE expires<?',(t,));db.execute('INSERT INTO sessions VALUES(?,?,?,?)',(digest(token.encode()),u,csrf,t+8*3600));audit(db,u,'登录成功');db.commit()
   secure='; Secure' if os.environ.get('XIN_SECURE_COOKIE')=='1' else ''
   return self.send(200,{'username':u,'roles':json.loads(row['roles']),'csrf':csrf},headers={'Set-Cookie':routing.cookie_name()+'='+token+'; HttpOnly; SameSite=Strict; Path='+routing.cookie_path(self.route_base)+'; Max-Age=28800'+secure})
- def upload(self,db,a,c,b):
+ def collect_case(self,cid,b):
+  with LOCK,connect() as db:
+   a=self.actor(db,True);self.need(a,'admin','analyst');c=loadcase(db,cid)
+   if b.get('expected_version')!=c['version']:raise HTTPError(409,'档案已更新，请刷新后采集')
+   task=jobs.enqueue(db,c,a,sys.modules[__name__]);db.commit();return self.send(202,task)
+ def job_list(self,db,a,query):
+  batch=query.get('batch_id',[''])[0];state=query.get('state',[''])[0]
+  if state and state not in jobs.STATES:raise Invalid('任务状态无效')
+  try:offset=int(query.get('offset',['0'])[0])
+  except ValueError:raise Invalid('分页参数无效')
+  if offset<0 or offset>1000000:raise Invalid('分页参数无效')
+  where=' WHERE batch_id=?' if batch else '';params=[batch] if batch else []
+  counts={x:0 for x in jobs.STATES}
+  for row in db.execute('SELECT state,COUNT(*) AS n FROM collection_jobs'+where+' GROUP BY state',params):counts[row['state']]=row['n']
+  if state:where+=(' AND ' if where else ' WHERE ')+'state=?';params.append(state)
+  total=db.execute('SELECT COUNT(*) FROM collection_jobs'+where,params).fetchone()[0]
+  rows=db.execute('SELECT * FROM collection_jobs'+where+" ORDER BY CASE WHEN state='running' THEN 0 WHEN state='queued' THEN 1 ELSE 2 END,updated_at DESC,id LIMIT 100 OFFSET ?",[*params,offset]).fetchall()
+  items=[]
+  for row in rows:
+   task=jobs.view(row,sys.modules[__name__]);case=loadcase(db,row['case_id'])
+   try:collection.platform_for(case['url']);collectable=True
+   except ValueError:collectable=False
+   task.update(title=case['title'],platform=case['platform'],url=case['url'],collectable=collectable);items.append(task)
+  batches=[dict(x) for x in db.execute("SELECT batch_id,MAX(created_at) AS created_at,COUNT(*) AS total FROM collection_jobs WHERE batch_id<>'' GROUP BY batch_id ORDER BY MAX(created_at) DESC LIMIT 50")]
+  return self.send(200,{'items':items,'counts':counts,'total':total,'offset':offset,'batch_id':batch,'batches':batches})
+ def upload(self,db,a,c,b,method='manual_upload'):
   self.need(a,'admin','analyst')
   if b.get('expected_version')!=c['version']:raise HTTPError(409,'档案已更新，请刷新后上传')
-  source=b.get('source_url','')
-  if source!=c['url']:raise Invalid('截图来源必须与本档案原文链接一致')
-  stamp=str(b.get('captured_at',''))
-  try:
-   dt=datetime.fromisoformat(stamp)
-   if not dt.tzinfo or dt.timestamp()>time.time()+300:raise ValueError()
-  except ValueError:raise Invalid('留存时间需为含时区的实际时间，不能填写未来时间')
-  try:
-   raw=base64.b64decode(b.get('data',''),validate=True)
-   if len(raw)>12*1024*1024:raise Invalid('单张图片上限12MB')
-   with Image.open(io.BytesIO(raw)) as im:
-    if im.format not in ('PNG','JPEG','WEBP') or im.width*im.height>40000000:raise Invalid('仅接受PNG/JPEG/WebP，像素数不超过4000万')
-    fmt=im.format;im.verify()
-  except Invalid:raise
-  except Exception:raise Invalid('文件不是有效的PNG/JPEG/WebP图片')
-  sha=digest(raw)
-  if db.execute('SELECT 1 FROM evidence WHERE case_id=? AND sha256=?',(c['id'],sha)).fetchone():raise Invalid('该图片已保存，不重复入库')
-  eid='EV-'+secrets.token_hex(8);ext={'PNG':'.png','JPEG':'.jpg','WEBP':'.webp'}[fmt];fn=eid+ext;note=str(b.get('note','')).strip()
-  if not note:raise Invalid('需填写截图核验说明（谁、何时、如何取得）')
-  db.execute('INSERT INTO evidence VALUES(?,?,?,?,?,?,?,?,?,?,?)',(eid,c['id'],source,stamp,sha,fn,'image/'+('jpeg' if fmt=='JPEG' else fmt.lower()),now(),'manual_upload',c.get('source_cell',''),note))
-  MEDIA.write(db,eid,fn,CIPHER.encrypt(raw))
-  # Appending evidence changes the dossier version and invalidates current confirmation.
-  base={k:v for k,v in c.items() if k not in ('id','version','created_by','updated_at')};save_case(db,base,a,c);audit(db,a['username'],'追加快照证据',c['id'],eid+' / SHA256 '+sha);db.commit();return self.send(201,{'id':eid,'sha256':sha,'version':c['version']+1})
+  result=store_evidence(db,a,c,b,method);db.commit();return self.send(201,result)
  def insert_review(self,db,c,r,level,a,note,s):
   db.execute('INSERT INTO reviews(case_id,record_version,rule_version,level,reviewer,note,score_json,time) VALUES(?,?,?,?,?,?,?,?)',(c['id'],c['version'],r['version'],level,a['username'],note,js(s),now()))
  def review(self,db,a,c,b):
@@ -457,7 +567,9 @@ class Handler(BaseHTTPRequestHandler):
   self.insert_review(db,c,r,lv,a,note,s);audit(db,a['username'],'确认风险等级',c['id'],lv+' / R'+str(r['version'])+' / V'+str(c['version']));db.commit();return self.send(201,{'ok':True})
  def import_preview(self,db,a,b):
   self.need(a,'admin','analyst');fmt=b.get('format');rows=[]
-  if fmt=='csv':
+  three=b.get('mode')=='three' or fmt=='xlsx_three'
+  if three:rows=three_field_rows(b)
+  elif fmt=='csv':
    text=str(b.get('text','')).lstrip('\ufeff');reader=csv.DictReader(io.StringIO(text))
    for n,row in enumerate(reader,2):rows.append((n,row))
   elif fmt=='xlsx_h':
@@ -494,17 +606,19 @@ class Handler(BaseHTTPRequestHandler):
   else:raise Invalid('格式须为csv或xlsx_h')
   if not rows:raise Invalid('未找到可导入行')
   if len(rows)>3000:raise Invalid('单批上限3000条，请分批导入')
-  existing={dec(x[0])['url'] for x in db.execute('SELECT body FROM cases')};seen=set();ready=[];errors=[];duplicates=[]
+  existing={collection.source_key(dec(x[0])['url']) for x in db.execute('SELECT body FROM cases')};seen=set();ready=[];errors=[];duplicates=[]
   for line,row in rows:
    try:
-    url=(row.get('舆情网址') or '').strip()
-    if url in existing or url in seen:duplicates.append(str(line));continue
-    c=normalize_case({'event_code':row.get('事件编号',''),'title':row.get('事件标题',''),'url':url,'phone':row.get('手机号',''),'platform':row.get('平台',''),'phone_source':row.get('手机号来源',''),'source_cell':row.get('来源单元格',''),'binding':'pending','metrics':{},'rights_feature':'unknown'},a)
-    ready.append(c);seen.add(url)
+    if three:
+     c=intake_case(row,a);c['source_cell']='导入行 '+str(line)
+    else:c=normalize_case({'event_code':row.get('事件编号',''),'title':row.get('事件标题',''),'url':row.get('舆情网址',''),'phone':row.get('手机号',''),'platform':row.get('平台',''),'phone_source':row.get('手机号来源',''),'source_cell':row.get('来源单元格',''),'binding':'pending','metrics':{},'rights_feature':'unknown'},a)
+    key=collection.source_key(c['url'])
+    if key in existing or key in seen:duplicates.append(str(line));continue
+    ready.append(c);seen.add(key)
    except Invalid as e:errors.append({'row':line,'error':str(e)})
   if not ready: return self.send(200,{'id':None,'valid':0,'errors':errors,'duplicates':duplicates,'preview':[]})
   bid='IM-'+secrets.token_hex(6);db.execute('INSERT INTO imports VALUES(?,?,?,?,0)',(bid,enc(ready),a['username'],now()));audit(db,a['username'],'预览导入',bid,str(len(ready))+'条有效 / '+str(len(errors))+'条错误');db.commit()
-  return self.send(200,{'id':bid,'valid':len(ready),'errors':errors,'duplicates':duplicates,'preview':[{'title':x['title'],'source_cell':x['source_cell'],'url':x['url'],'phone':('已提供，待核实' if x['phone'] else '待绑定')} for x in ready[:30]]})
+  return self.send(200,{'id':bid,'valid':len(ready),'errors':errors,'duplicates':duplicates,'preview':[{'title':x['title'],'user_name':x.get('user_name',''),'platform':x['platform'],'source_cell':x['source_cell'],'url':x['url'],'phone':('已提供，待核实' if x['phone'] else '待绑定'),'collectable':x['platform']!='待识别'} for x in ready[:30]]})
  def export(self,db,a,b):
   if b.get('kind') not in ('formal','masked'):raise Invalid('导出类型须为formal或masked')
   full=b.get('kind')=='formal'
@@ -537,6 +651,7 @@ def main():
  acquire_instance_lock()
  init()
  if not args.no_seed:add_seed()
+ worker=jobs.Worker(sys.modules[__name__]);worker.start()
  print('投诉治理“换芯计划”试点系统 http://'+args.host+':'+str(args.port),flush=True)
  ThreadingHTTPServer.daemon_threads=True
  ThreadingHTTPServer((args.host,args.port),Handler).serve_forever()

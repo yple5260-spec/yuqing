@@ -9,7 +9,7 @@ RUN (python -m pip install --no-cache-dir --disable-pip-version-check --timeout 
     || python -m pip install --no-cache-dir --disable-pip-version-check --timeout 20 --retries 1 \
         --index-url https://pypi.org/simple -r requirements.txt) \
     && groupadd --gid 10001 app && useradd --uid 10001 --gid app --no-create-home app && mkdir /data && chown app:app /data
-COPY --chown=app:app server.py scoring.py database.py routing.py storage.py manage.py migrate_sqlite.py migrate_media.py ./
+COPY --chown=app:app server.py scoring.py database.py routing.py storage.py collection.py weibo.py social.py jobs.py portrait.py manage.py migrate_sqlite.py migrate_media.py ./
 COPY --chown=app:app static/ ./static/
 USER 10001:10001
 EXPOSE 8765
