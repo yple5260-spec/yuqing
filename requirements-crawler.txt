@@ -1,2 +1,3 @@
 # Isolated collector environment; do not install into the business service environment.
 crawl4ai==0.9.5
+playwright==1.65.2

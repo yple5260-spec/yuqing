@@ -109,7 +109,8 @@ def collect(url):
         if proxy:env['XIN_CRAWLER_PROXY_CONFIG'] = json.dumps(proxy)
         work = ROOT / 'runtime' / 'crawler-workdir'
         work.mkdir(parents=True, exist_ok=True)
-        result = subprocess.run([str(python.resolve()), str(ROOT / 'scripts' / 'collect_page.py'), url],
+        # Keep the virtual environment's interpreter path when it is a symlink.
+        result = subprocess.run([str(python.absolute()), str(ROOT / 'scripts' / 'collect_page.py'), url],
                                 cwd=work, env=env, capture_output=True, encoding='utf-8', timeout=75)
         if result.returncode or len(result.stdout) > 18 * 1024 * 1024:
             raise ValueError('采集进程异常，请检查独立采集环境；未写入快照')
