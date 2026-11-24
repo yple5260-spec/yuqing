@@ -458,7 +458,9 @@ class Handler(BaseHTTPRequestHandler):
      if b.get('approve'):
       self.insert_review(db,c,r,req['level'],a,req['note']+'；独立审批：'+note,s)
      db.execute('UPDATE overrides SET status=? WHERE id=?',('approved' if b.get('approve') else 'rejected',oid));audit(db,a['username'],'审批等级覆盖',c['id'],oid+'；'+note);db.commit();return self.send(200,{'ok':True})
-    if path=='/api/overrides' and method=='GET':return self.send(200,[dict(x) for x in db.execute("SELECT * FROM overrides ORDER BY created_at DESC")])
+    if path=='/api/overrides' and method=='GET':
+     self.need(a,'reviewer')
+     return self.send(200,[dict(x) for x in db.execute("SELECT * FROM overrides ORDER BY created_at DESC")])
     if path.startswith('/api/evidence/') and method=='GET':
      eid=path.split('/')[-1];row=db.execute('SELECT * FROM evidence WHERE id=?',(eid,)).fetchone()
      if not row:raise HTTPError(404,'证据不存在')
@@ -508,7 +510,7 @@ class Handler(BaseHTTPRequestHandler):
  def password_valid(self,p):
   if not isinstance(p,str) or len(p)<12 or len(p)>128:raise Invalid('密码长度须为12–128位')
  def login(self,db,b):
-  u=str(b.get('username',''));p=str(b.get('password',''));ip=self.client_address[0];t=time.time()
+  u=str(b.get('username',''));p=str(b.get('password',''));ip=routing.login_client_ip(self.headers,self.client_address[0]);t=time.time()
   limit=db.execute('SELECT * FROM login_limits WHERE ip=?',(ip,)).fetchone()
   if limit and limit['locked_until']>t:raise HTTPError(429,'尝试过多，请15分钟后重试')
   row=db.execute('SELECT * FROM accounts WHERE username=?',(u,)).fetchone()

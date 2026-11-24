@@ -1,5 +1,6 @@
 """Synthetic deployment checks. PostgreSQL always uses a disposable isolated schema."""
 import base64
+from email.message import Message
 import http.client
 import io
 import json
@@ -9,7 +10,9 @@ import secrets
 import sqlite3
 import tempfile
 import threading
+import time
 import unittest
+from unittest.mock import patch
 import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from PIL import Image
@@ -103,6 +106,50 @@ class DeploymentTests(unittest.TestCase):
     def test_proxy_validation(self):
         self.assertEqual(routing.route_base({'X-OneView-Route-Base': '/apps/bfzx-yqda'}, '8.8.8.8'), '/')
         self.assertEqual(self.request('GET', '/', headers={'X-OneView-Route-Base': '/evil'})[0], 400)
+
+    def test_override_list_requires_reviewer(self):
+        viewer_password = secrets.token_urlsafe(16)
+        with server.connect() as db:
+            db.execute('INSERT INTO overrides (id, case_id, note) VALUES (?, ?, ?)',
+                       ('OV-TEST', 'CASE-TEST', 'synthetic review request'))
+            db.execute('INSERT INTO accounts (username, password, roles) VALUES (?, ?, ?)',
+                       ('viewer-test', server.pw_hash(viewer_password), '["viewer"]'))
+        self.assertEqual(self.request('GET', '/api/overrides')[0], 401)
+        for user, password, expected in (('viewer-test', viewer_password, 403),
+                                         ('admin', self.creds['admin'], 403),
+                                         ('reviewer', self.creds['reviewer'], 200)):
+            with self.subTest(user=user):
+                status, me, headers = self.request('POST', '/api/login', {'username': user, 'password': password})
+                self.assertEqual(status, 200, me)
+                cookie = {'Cookie': headers['Set-Cookie'].split(';')[0]}
+                status, records, _ = self.request('GET', '/api/overrides', headers=cookie)
+                self.assertEqual(status, expected)
+                if expected == 200:
+                    self.assertEqual([row['id'] for row in records], ['OV-TEST'])
+
+    def test_proxy_login_limits_use_verified_client(self):
+        with server.connect() as db:
+            db.execute('INSERT INTO login_limits VALUES (?, ?, ?)', ('198.51.100.30', 20, time.time() + 900))
+        payload = {'username': 'admin', 'password': self.creds['admin']}
+        with patch.dict(os.environ, {'XIN_TRUSTED_PROXY_CIDRS': '127.0.0.1/32,192.0.2.4/32'}):
+            for client, expected in (('198.51.100.30', 429), ('198.51.100.31', 200)):
+                with self.subTest(client=client):
+                    header = {'X-Forwarded-For': f'203.0.113.1, {client}, 192.0.2.4'}
+                    self.assertEqual(self.request('POST', '/api/login', payload, header)[0], expected)
+
+    def test_login_ip_rejects_untrusted_or_ambiguous_proxy_headers(self):
+        headers = Message()
+        headers['X-Forwarded-For'] = '198.51.100.30'
+        with patch.dict(os.environ, {'XIN_TRUSTED_PROXY_CIDRS': ''}):
+            self.assertEqual(routing.login_client_ip(headers, '127.0.0.1'), '127.0.0.1')
+        with patch.dict(os.environ, {'XIN_TRUSTED_PROXY_CIDRS': '127.0.0.1/32'}):
+            self.assertEqual(routing.login_client_ip(headers, '203.0.113.5'), '203.0.113.5')
+            self.assertEqual(routing.login_client_ip(headers, '127.0.0.1'), '198.51.100.30')
+            headers['X-Forwarded-For'] = '203.0.113.5'
+            self.assertEqual(routing.login_client_ip(headers, '127.0.0.1'), '127.0.0.1')
+            del headers['X-Forwarded-For']
+            headers['X-Forwarded-For'] = '198.51.100.30, invalid'
+            self.assertEqual(routing.login_client_ip(headers, '127.0.0.1'), '127.0.0.1')
 
     def test_transaction_rollback_and_login_conflict(self):
         with self.assertRaises(RuntimeError):
