@@ -22,6 +22,8 @@ ROOT=Path(__file__).resolve().parent
 DATA=Path(os.environ.get('XIN_DATA_DIR',ROOT/'data')).resolve()
 MAX_BODY=20*1024*1024
 ROLES={'admin','analyst','reviewer','exporter','viewer'}
+COLLECTION_ROLES=('admin','analyst')
+ORIGINAL_EVIDENCE_ROLES=(*COLLECTION_ROLES,'reviewer')
 LOCK=threading.RLock()
 
 def now(): return datetime.now(timezone.utc).isoformat(timespec='seconds')
@@ -70,16 +72,24 @@ def current_review(db,c,r):
 
 def case_view(db,c,actor,detail=False):
  r=read_rules(db); ev=evidence_for(db,c['id']); s=score(c,r,ev); review=current_review(db,c,r)
- full='admin' in actor['roles'] or 'analyst' in actor['roles']
+ roles=set(actor['roles'])
+ full=bool(roles.intersection(COLLECTION_ROLES))
  phone=c.get('phone',''); c=dict(c); c['phone']=phone if full else (phone[:3]+'****'+phone[-4:] if phone else '')
  c['phone_masked']=phone[:3]+'****'+phone[-4:] if phone else '待绑定'
  c['evaluation']=s;c['review']=review;c['evidence_count']=len(ev)
  c['status']='已确认' if review else ('待复核' if s['eligible'] else ('待绑定' if c.get('binding')!='verified' else '证据待补全'))
  if detail:
   c['portrait']=portrait.build(c)
-  c['evidence']=list(ev.values())
+  if roles.intersection(ORIGINAL_EVIDENCE_ROLES):
+   c['evidence']=list(ev.values())
+  else:
+   metadata=('id','source_url','captured_at','source_cell','sha256')
+   c['evidence']=[{key:row[key] for key in metadata} for row in ev.values()]
   task=db.execute('SELECT * FROM collection_jobs WHERE case_id=? ORDER BY updated_at DESC,id DESC LIMIT 1',(c['id'],)).fetchone()
-  c['collection_task']=jobs.view(task,sys.modules[__name__]) if task else None
+  c['collection_task']=None
+  if task:
+   c['collection_task']=jobs.view(task,sys.modules[__name__]) if full else {
+    key:task[key] for key in ('state','stage','updated_at')}
   c['reviews']=[dict(x) for x in db.execute('SELECT * FROM reviews WHERE case_id=? ORDER BY id DESC',(c['id'],))]
  else:c.pop('metrics',None)
  return c
@@ -410,9 +420,11 @@ class Handler(BaseHTTPRequestHandler):
      c=intake_case(b,a);cid=save_case(db,c,a);saved=loadcase(db,cid)
      task=jobs.enqueue(db,saved,a,sys.modules[__name__]);db.commit()
      return self.send(201,dict(case_view(db,saved,a,True),task=task))
-    if path=='/api/collection/jobs' and method=='GET':return self.job_list(db,a,query)
+    if path=='/api/collection/jobs' and method=='GET':
+     self.need(a,*COLLECTION_ROLES)
+     return self.job_list(db,a,query)
     if re.fullmatch(r'/api/collection/jobs/[^/]+/retry',path) and method=='POST':
-     self.need(a,'admin','analyst');task=jobs.retry(db,path.split('/')[4],a,sys.modules[__name__]);db.commit();return self.send(202,task)
+     self.need(a,*COLLECTION_ROLES);task=jobs.retry(db,path.split('/')[4],a,sys.modules[__name__]);db.commit();return self.send(202,task)
     if path=='/api/cases':
      if method=='GET':
       vals=[case_view(db,loadcase(db,x[0]),a) for x in db.execute('SELECT id FROM cases ORDER BY updated_at DESC')]
@@ -462,6 +474,7 @@ class Handler(BaseHTTPRequestHandler):
      self.need(a,'reviewer')
      return self.send(200,[dict(x) for x in db.execute("SELECT * FROM overrides ORDER BY created_at DESC")])
     if path.startswith('/api/evidence/') and method=='GET':
+     self.need(a,*ORIGINAL_EVIDENCE_ROLES)
      eid=path.split('/')[-1];row=db.execute('SELECT * FROM evidence WHERE id=?',(eid,)).fetchone()
      if not row:raise HTTPError(404,'证据不存在')
      raw=CIPHER.decrypt(MEDIA.read(db,row))

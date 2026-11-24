@@ -3,6 +3,7 @@ import base64
 import io
 import json
 from pathlib import Path
+import secrets
 import sys
 import unittest
 from unittest.mock import patch
@@ -66,13 +67,65 @@ https://people.rednet.cn/front/messages/detail?id=800,19900000000,库内重复
         self.assertEqual(self.request('POST', endpoint, {}, 'admin')[0], 202)
         self.assertEqual(self.request('POST', endpoint, {}, 'admin')[0], 422)
         with patch.object(server.collection, 'collect', side_effect=collect): self.assertTrue(worker.run_once())
-        _, filtered, _ = self.request('GET', '/api/collection/jobs?state=restricted', who='reviewer')
+        self.assertEqual(self.request('GET', '/api/collection/jobs?state=restricted', who='reviewer')[0], 403)
+        _, filtered, _ = self.request('GET', '/api/collection/jobs?state=restricted', who='admin')
         self.assertEqual(filtered['total'], 1)
         self.assertEqual(filtered['items'][0]['attempts'], 2)
         with server.connect() as db:
             self.assertEqual(db.execute('SELECT COUNT(*) FROM evidence WHERE case_id IN (?,?,?,?)', committed['created']).fetchone()[0], 2)
         self.assertNotIn('批量测试甲'.encode(), (server.DATA / 'xin.db').read_bytes())
         self.assertTrue(self.request('GET', '/api/audit', who='admin')[1]['chain_valid'])
+
+    def test_evidence_and_collection_visibility_by_role(self):
+        case = self.intake('https://people.rednet.cn/front/messages/detail?id=970')
+        capture = self.result(case['url'])
+        capture['collection_state'] = 'partial'
+        with patch.object(server.collection, 'collect', return_value=capture):
+            self.assertTrue(jobs.Worker(server).run_once())
+
+        endpoint = '/api/cases/' + case['id']
+        _, full_case, _ = self.request('GET', endpoint, who='admin')
+        evidence = full_case['evidence'][0]
+        image_path = '/api/evidence/' + evidence['id']
+        tasks_path = '/api/collection/jobs'
+        retry_path = tasks_path + '/' + case['task']['id'] + '/retry'
+        self.assertEqual(self.request('GET', image_path)[0], 401)
+        self.assertEqual(self.request('GET', tasks_path)[0], 401)
+
+        for role in ('admin', 'analyst', 'reviewer', 'exporter', 'viewer'):
+            with self.subTest(role=role):
+                username = 'test-only-' + role
+                password = secrets.token_urlsafe(16)
+                status, _, _ = self.request('POST', '/api/accounts', {
+                    'username': username, 'password': password, 'roles': [role]}, 'admin')
+                self.assertEqual(status, 201)
+                status, actor, headers = self.request('POST', '/api/login', {'username': username, 'password': password})
+                self.assertEqual(status, 200)
+                self.sessions[username] = {'Cookie': headers['Set-Cookie'].split(';')[0], 'X-CSRF-Token': actor['csrf']}
+
+                operator = role in ('admin', 'analyst')
+                original = operator or role == 'reviewer'
+                status, raw, _ = self.request('GET', image_path, who=username)
+                self.assertEqual(status, 200 if original else 403)
+                if original:
+                    self.assertEqual(raw, self.image)
+                status, task_list, _ = self.request('GET', tasks_path, who=username)
+                self.assertEqual(status, 200 if operator else 403)
+                if operator:
+                    self.assertEqual(task_list['items'][0]['url'], case['url'])
+                else:
+                    self.assertEqual(self.request('POST', retry_path, {}, username)[0], 403)
+                status, dossier, _ = self.request('GET', endpoint, who=username)
+                self.assertEqual(status, 200)
+                self.assertEqual(dossier['collection_task']['state'], 'partial')
+                self.assertEqual(dossier['collection']['nickname'], capture['nickname'])
+                if operator:
+                    self.assertEqual(dossier['collection_task']['result']['id'], evidence['id'])
+                else:
+                    self.assertEqual(set(dossier['collection_task']), {'state', 'stage', 'updated_at'})
+                expected_fields = set(evidence) if original else {'id', 'source_url', 'captured_at', 'source_cell', 'sha256'}
+                self.assertEqual(set(dossier['evidence'][0]), expected_fields)
+                self.assertEqual(dossier['evidence'][0]['sha256'], evidence['sha256'])
 
     def test_restart_recovery_version_protection_and_single_active_job(self):
         c = self.intake('https://people.rednet.cn/front/messages/detail?id=900')
