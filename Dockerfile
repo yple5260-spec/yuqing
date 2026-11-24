@@ -2,7 +2,6 @@ FROM python:3.12-slim-trixie
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 XIN_DATA_DIR=/data XIN_HOST=0.0.0.0 XIN_PORT=8765 XIN_REQUIRE_POSTGRES=1 \
     XIN_CRAWLER_PYTHON=/opt/crawler/bin/python PLAYWRIGHT_BROWSERS_PATH=/opt/playwright
 ARG DEBIAN_MIRROR=https://mirrors.tuna.tsinghua.edu.cn/debian
-ARG PLAYWRIGHT_DOWNLOAD_MIRROR=https://cdn.playwright.dev
 WORKDIR /app
 COPY requirements.txt requirements-crawler.txt ./
 RUN set -eu; \
@@ -29,9 +28,10 @@ RUN set -eu; \
     }; \
     install_browser_libraries || { cp /tmp/debian.sources "$sources"; install_browser_libraries; }; \
     rm -rf /var/lib/apt/lists/* /tmp/debian.sources
+COPY scripts/install_chromium.py ./scripts/
 RUN set -eu; \
     export PLAYWRIGHT_DOWNLOAD_CONNECTION_TIMEOUT=90000; \
-    PLAYWRIGHT_DOWNLOAD_HOST="$PLAYWRIGHT_DOWNLOAD_MIRROR" "$XIN_CRAWLER_PYTHON" -m playwright install --only-shell chromium \
+    "$XIN_CRAWLER_PYTHON" scripts/install_chromium.py \
         || "$XIN_CRAWLER_PYTHON" -m playwright install --only-shell chromium; \
     groupadd --gid 10001 app; \
     useradd --uid 10001 --gid app --create-home app; \
