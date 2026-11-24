@@ -23,8 +23,9 @@ RUN set -eu; \
     sed -i "s|^URIs: http://deb.debian.org/debian$|URIs: $DEBIAN_MIRROR|" "$sources"; \
     export DEBIAN_FRONTEND=noninteractive; \
     install_browser_libraries() { \
-        "$XIN_CRAWLER_PYTHON" -m playwright install-deps chromium \
-        && apt-get install -y --no-install-recommends fonts-noto-cjk; \
+        apt-get update \
+        && apt-get install -y --no-install-recommends libatomic1 fonts-noto-cjk \
+        && "$XIN_CRAWLER_PYTHON" -m playwright install-deps chromium; \
     }; \
     install_browser_libraries || { cp /tmp/debian.sources "$sources"; install_browser_libraries; }; \
     rm -rf /var/lib/apt/lists/* /tmp/debian.sources
